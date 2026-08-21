@@ -1,0 +1,21 @@
+[project]
+name = "spotify-mcp"
+version = "0.1.0"
+description = "MCP server wrapping spotipy so Claude can search Spotify, read playlists/saved tracks, and pull recommendation/related-artist signals"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "spotipy>=2.24.0",
+    "mcp>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/umsachde/spotify-mcp"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

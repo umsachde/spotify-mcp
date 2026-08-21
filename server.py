@@ -1,0 +1,251 @@
+"""MCP server exposing Spotify (via spotipy) as tools for Claude.
+
+Read-heavy by design -- built specifically for re-com's Spotify provider
+(see re-com/spotify_client.py), not as a general playback-control server.
+Tools cover search, playlists/saved tracks, an artist's top tracks and
+related artists, seed-track recommendations, and recently played -- the same
+kind of surface ytmusic-mcp exposes for YouTube Music. Two write tools
+(create_playlist, add_tracks_to_playlist) exist so a re-com recommendation
+list can be turned into a real Spotify playlist.
+
+Some endpoints here (recommendations, related-artists) are restricted by
+Spotify for API apps created after November 2024's policy change; if your
+app doesn't have "Extended Quota Mode" or grandfathered access, those calls
+fail with a 403 that `handle_errors` turns into a clear message rather than
+a raw traceback -- re-com's spotify_client.py already treats that as a
+signal that's simply unavailable, not a fatal error.
+"""
+
+import functools
+import os
+from typing import Any
+
+import spotipy
+from mcp.server.mcpserver import MCPServer
+from spotipy.exceptions import SpotifyException
+from spotipy.oauth2 import SpotifyOAuth
+
+CACHE_PATH = os.environ.get("SPOTIFY_CACHE_PATH", ".spotify_cache")
+REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+SCOPE = (
+    "user-library-read "
+    "playlist-read-private "
+    "playlist-read-collaborative "
+    "user-read-recently-played "
+    "user-top-read "
+    "playlist-modify-public "
+    "playlist-modify-private"
+)
+AUTH_HELP = (
+    "Spotify auth looks invalid, expired, or missing. Run scripts/setup_auth_spotify.py "
+    "to authenticate (see README)."
+)
+
+mcp = MCPServer("spotify")
+
+_sp: spotipy.Spotify | None = None
+
+
+def _auth_manager() -> SpotifyOAuth:
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID")
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise RuntimeError(
+            "SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set (from your Spotify "
+            "Developer Dashboard app). See README."
+        )
+    return SpotifyOAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=REDIRECT_URI,
+        scope=SCOPE,
+        cache_path=CACHE_PATH,
+        open_browser=False,
+    )
+
+
+def _client() -> spotipy.Spotify:
+    global _sp
+    if _sp is None:
+        _sp = spotipy.Spotify(auth_manager=_auth_manager())
+    return _sp
+
+
+def handle_errors(fn):
+    """Translate spotipy/network failures into clear, actionable messages.
+
+    Mirrors ytmusic-mcp's handle_errors: auth/rate-limit/restricted-endpoint/
+    network failures become one clean RuntimeError instead of a raw
+    traceback or spotipy's own exception type.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except SpotifyException as e:
+            if e.http_status in (401, 403) and "insufficient" not in (e.msg or "").lower():
+                if e.http_status == 401:
+                    raise RuntimeError(AUTH_HELP) from e
+                raise RuntimeError(
+                    "Spotify returned 403 Forbidden. Either this app lacks access to this "
+                    "endpoint (Spotify restricts /recommendations and related-artists for "
+                    "apps created after Nov 2024 without Extended Quota Mode), or the "
+                    "required OAuth scope wasn't granted -- rerun scripts/setup_auth_spotify.py."
+                ) from e
+            if e.http_status == 429:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                hint = f" (retry after {retry_after}s)" if retry_after else ""
+                raise RuntimeError(f"Spotify is rate-limiting requests right now{hint}.") from e
+            raise RuntimeError(f"Spotify API error: {e.msg or e}") from e
+        except spotipy.SpotifyOauthError as e:
+            raise RuntimeError(f"{AUTH_HELP} ({e})") from e
+
+    return wrapper
+
+
+def _paginate(first_page: dict[str, Any], limit: int | None, item_key: str = "items") -> list[Any]:
+    """Follow spotipy's cursor-paginated responses until exhausted or `limit`
+    items are collected. `limit=None` fetches everything."""
+    sp = _client()
+    items: list[Any] = []
+    page = first_page
+    while page:
+        items.extend(page.get(item_key, []))
+        if limit is not None and len(items) >= limit:
+            return items[:limit]
+        page = sp.next(page) if page.get("next") else None
+    return items
+
+
+@mcp.tool()
+@handle_errors
+def search_music(query: str, filter: str = "track", limit: int = 20) -> list[dict[str, Any]]:
+    """Search Spotify. `filter` is "track" or "artist"."""
+    kind = "artist" if filter == "artist" else "track"
+    result = _client().search(q=query, type=kind, limit=min(limit, 50))
+    key = "artists" if kind == "artist" else "tracks"
+    return result.get(key, {}).get("items", [])
+
+
+@mcp.tool()
+@handle_errors
+def get_playlists(limit: int | None = None) -> list[dict[str, Any]]:
+    """List the current user's playlists. Omit `limit` to fetch all of them."""
+    first = _client().current_user_playlists(limit=min(limit or 50, 50))
+    return _paginate(first, limit)
+
+
+@mcp.tool()
+@handle_errors
+def get_playlist_tracks(playlist_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+    """Get the tracks in a playlist. Omit `limit` to fetch the entire playlist.
+
+    Local files and episodes (no `track.id`) are skipped.
+    """
+    first = _client().playlist_items(playlist_id, limit=min(limit or 100, 100))
+    raw_items = _paginate(first, None)  # page fully; trim to `limit` after filtering below
+    tracks = [it["track"] for it in raw_items if it.get("track") and it["track"].get("id")]
+    return tracks[:limit] if limit is not None else tracks
+
+
+@mcp.tool()
+@handle_errors
+def get_saved_tracks(limit: int | None = None) -> list[dict[str, Any]]:
+    """Get the current user's saved ("Liked Songs") tracks. Omit `limit` for all of them."""
+    first = _client().current_user_saved_tracks(limit=min(limit or 50, 50))
+    raw_items = _paginate(first, None)
+    tracks = [it["track"] for it in raw_items if it.get("track") and it["track"].get("id")]
+    return tracks[:limit] if limit is not None else tracks
+
+
+@mcp.tool()
+@handle_errors
+def get_track(track_id: str) -> dict[str, Any]:
+    """Get a single track's metadata (title, artists, album, ...)."""
+    return _client().track(track_id)
+
+
+@mcp.tool()
+@handle_errors
+def get_recommendations(seed_track_id: str | None, limit: int = 25) -> list[dict[str, Any]]:
+    """Get Spotify's algorithmic recommendations seeded from one track.
+
+    May 403 if this app doesn't have access to /recommendations -- Spotify
+    restricts it for apps created after Nov 2024 without Extended Quota Mode.
+    """
+    if not seed_track_id:
+        return []
+    result = _client().recommendations(seed_tracks=[seed_track_id], limit=min(limit, 100))
+    return result.get("tracks", [])
+
+
+@mcp.tool()
+@handle_errors
+def get_artist(artist_id: str) -> dict[str, Any]:
+    """Get an artist's profile (name, genres, popularity, images)."""
+    return _client().artist(artist_id)
+
+
+@mcp.tool()
+@handle_errors
+def get_artist_top_tracks(artist_id: str) -> list[dict[str, Any]]:
+    """Get an artist's top tracks (Spotify caps this at ~10 -- there's no
+    "full catalog" endpoint the way YouTube Music's channel Songs tab has)."""
+    return _client().artist_top_tracks(artist_id).get("tracks", [])
+
+
+@mcp.tool()
+@handle_errors
+def get_related_artists(artist_id: str) -> list[dict[str, Any]]:
+    """Get artists related to the given one.
+
+    May 403 for apps without access to this endpoint -- same restriction as
+    /recommendations.
+    """
+    return _client().artist_related_artists(artist_id).get("artists", [])
+
+
+@mcp.tool()
+@handle_errors
+def get_recently_played(limit: int = 50) -> list[dict[str, Any]]:
+    """Get the user's recently played tracks (each item wraps a "track" key)."""
+    result = _client().current_user_recently_played(limit=min(limit, 50))
+    return result.get("items", [])
+
+
+@mcp.tool()
+@handle_errors
+def create_playlist(name: str, public: bool = False, description: str = "") -> dict[str, Any]:
+    """Create a new playlist owned by the current user and return it (id, name, ...)."""
+    return _client().current_user_playlist_create(name, public=public, description=description)
+
+
+@mcp.tool()
+@handle_errors
+def add_tracks_to_playlist(playlist_id: str, track_ids: list[str]) -> str:
+    """Add tracks to a playlist by Spotify track ID (or URI). Chunks in batches of 100,
+    Spotify's per-request limit."""
+    sp = _client()
+    for i in range(0, len(track_ids), 100):
+        sp.playlist_add_items(playlist_id, track_ids[i : i + 100])
+    return f"Added {len(track_ids)} track(s) to playlist {playlist_id}."
+
+
+@mcp.tool()
+def logout() -> str:
+    """Delete the cached Spotify OAuth token.
+
+    Subsequent tool calls will fail until you re-authenticate via
+    scripts/setup_auth_spotify.py.
+    """
+    global _sp
+    if not os.path.exists(CACHE_PATH):
+        return f"No cached token found at {CACHE_PATH}; nothing to remove."
+    os.remove(CACHE_PATH)
+    _sp = None
+    return f"Removed {CACHE_PATH}. Re-run scripts/setup_auth_spotify.py to authenticate again."
+
+
+if __name__ == "__main__":
+    mcp.run()

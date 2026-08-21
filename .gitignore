@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+*.egg-info/
+.pytest_cache/
+
+# Spotify OAuth token cache — never commit
+.spotify_cache
+.env
