@@ -42,8 +42,7 @@ class _FakeSpotify:
         artist_top_tracks_result=None,
         related_artists_result=None,
         recently_played_result=None,
-        current_user_result=None,
-        user_playlist_create_result=None,
+        current_user_playlist_create_result=None,
     ):
         self._search_results = search_results
         self._playlists_pages = playlists_pages or []
@@ -55,9 +54,9 @@ class _FakeSpotify:
         self._artist_top_tracks_result = artist_top_tracks_result
         self._related_artists_result = related_artists_result
         self._recently_played_result = recently_played_result
-        self._current_user_result = current_user_result
-        self._user_playlist_create_result = user_playlist_create_result
+        self._current_user_playlist_create_result = current_user_playlist_create_result
         self.playlist_add_items_calls = []
+        self.playlist_create_calls = []
 
     def _raise_if_exc(self, value):
         if isinstance(value, Exception):
@@ -101,11 +100,13 @@ class _FakeSpotify:
     def current_user_recently_played(self, limit):
         return self._raise_if_exc(self._recently_played_result)
 
-    def current_user(self):
-        return self._raise_if_exc(self._current_user_result)
-
-    def user_playlist_create(self, user, name, public, description):
-        return self._raise_if_exc(self._user_playlist_create_result)
+    # spotipy's one-call convenience method, which is what server.py uses.
+    # The fake previously mirrored the older two-step
+    # current_user() + user_playlist_create() pair instead, so this test
+    # exercised a surface the server never touches and failed on the one it does.
+    def current_user_playlist_create(self, name, public=False, description=""):
+        self.playlist_create_calls.append((name, public, description))
+        return self._raise_if_exc(self._current_user_playlist_create_result)
 
     def playlist_add_items(self, playlist_id, items):
         self.playlist_add_items_calls.append((playlist_id, list(items)))
@@ -226,12 +227,20 @@ def test_get_recently_played(monkeypatch):
 
 
 def test_create_playlist(monkeypatch):
-    fake = _FakeSpotify(
-        current_user_result={"id": "u1"},
-        user_playlist_create_result={"id": "p1", "name": "jaytest"},
-    )
+    fake = _FakeSpotify(current_user_playlist_create_result={"id": "p1", "name": "jaytest"})
     _install(monkeypatch, fake)
     assert create_playlist("jaytest") == {"id": "p1", "name": "jaytest"}
+    # Playlists default to private: this server is a discovery backend, and
+    # creating public playlists on someone's account by default would be a
+    # surprising side effect.
+    assert fake.playlist_create_calls == [("jaytest", False, "")]
+
+
+def test_create_playlist_passes_visibility_and_description(monkeypatch):
+    fake = _FakeSpotify(current_user_playlist_create_result={"id": "p1", "name": "mix"})
+    _install(monkeypatch, fake)
+    create_playlist("mix", public=True, description="from re-com")
+    assert fake.playlist_create_calls == [("mix", True, "from re-com")]
 
 
 def test_add_tracks_to_playlist_single_batch(monkeypatch):
