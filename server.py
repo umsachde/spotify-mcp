@@ -216,6 +216,50 @@ def get_recently_played(limit: int = 50) -> list[dict[str, Any]]:
 
 @mcp.tool()
 @handle_errors
+def get_current_user() -> dict[str, Any]:
+    """Get the authenticated user's own profile (id, display_name, ...).
+
+    The `id` is the only way to tell a playlist the user owns from one they
+    merely follow: `get_playlists` returns both, indistinguishable except by
+    `owner.id`. That distinction is load-bearing rather than cosmetic --
+    Spotify 403s `playlist_items` on another user's playlist, so a caller that
+    treats followed playlists as its own gets an error it cannot act on.
+    """
+    return _client().current_user()
+
+
+@mcp.tool()
+@handle_errors
+def get_artist_albums(artist_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+    """Get an artist's albums and singles. Omit `limit` to fetch all of them.
+
+    This plus `get_album_tracks` is the only route to an artist's real catalog
+    that survives Spotify's post-Nov-2024 restrictions: `get_artist_top_tracks`
+    403s for apps without Extended Quota Mode and caps at ~10 even when it
+    works. Appears-on and compilation albums are excluded -- they would credit
+    the artist for other people's records.
+    """
+    first = _client().artist_albums(
+        artist_id, album_type="album,single", limit=min(limit or 50, 50)
+    )
+    return _paginate(first, limit)
+
+
+@mcp.tool()
+@handle_errors
+def get_album_tracks(album_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+    """Get an album's tracks. Omit `limit` to fetch all of them.
+
+    Album track objects are the "simplified" shape and carry no `album` key of
+    their own, so callers that need one should attach it from the album they
+    asked for.
+    """
+    first = _client().album_tracks(album_id, limit=min(limit or 50, 50))
+    return _paginate(first, limit)
+
+
+@mcp.tool()
+@handle_errors
 def create_playlist(name: str, public: bool = False, description: str = "") -> dict[str, Any]:
     """Create a new playlist owned by the current user and return it (id, name, ...)."""
     return _client().current_user_playlist_create(name, public=public, description=description)

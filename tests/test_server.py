@@ -43,6 +43,9 @@ class _FakeSpotify:
         related_artists_result=None,
         recently_played_result=None,
         current_user_playlist_create_result=None,
+        current_user_result=None,
+        artist_albums_pages=None,
+        album_tracks_pages=None,
     ):
         self._search_results = search_results
         self._playlists_pages = playlists_pages or []
@@ -55,8 +58,12 @@ class _FakeSpotify:
         self._related_artists_result = related_artists_result
         self._recently_played_result = recently_played_result
         self._current_user_playlist_create_result = current_user_playlist_create_result
+        self._current_user_result = current_user_result
+        self._artist_albums_pages = artist_albums_pages or []
+        self._album_tracks_pages = album_tracks_pages or []
         self.playlist_add_items_calls = []
         self.playlist_create_calls = []
+        self.artist_albums_calls = []
 
     def _raise_if_exc(self, value):
         if isinstance(value, Exception):
@@ -75,8 +82,20 @@ class _FakeSpotify:
     def current_user_saved_tracks(self, limit):
         return self._raise_if_exc(self._saved_tracks_pages[0])
 
+    def current_user(self):
+        return self._raise_if_exc(self._current_user_result)
+
+    def artist_albums(self, artist_id, album_type=None, limit=None):
+        self.artist_albums_calls.append((artist_id, album_type))
+        return self._raise_if_exc(self._artist_albums_pages[0])
+
+    def album_tracks(self, album_id, limit=None):
+        return self._raise_if_exc(self._album_tracks_pages[0])
+
     def next(self, page):
-        for pages_list in (self._playlists_pages, self._playlist_items_pages, self._saved_tracks_pages):
+        for pages_list in (self._playlists_pages, self._playlist_items_pages,
+                           self._saved_tracks_pages, self._artist_albums_pages,
+                           self._album_tracks_pages):
             if pages_list and pages_list[0] is page:
                 pages_list.pop(0)
                 return pages_list[0] if pages_list else None
@@ -331,3 +350,46 @@ def test_logout_removes_cache_file(monkeypatch, tmp_path):
     assert not cache.exists()
     assert server._sp is None
     assert "Removed" in result
+
+
+# --- identity, and the artist catalog that survives the restrictions --------
+
+
+def test_get_current_user_returns_the_profile(monkeypatch):
+    _install(monkeypatch, _FakeSpotify(current_user_result={"id": "jay", "display_name": "Jay"}))
+    assert server.get_current_user()["id"] == "jay"
+
+
+def test_artist_albums_pages_through_everything(monkeypatch):
+    fake = _FakeSpotify(artist_albums_pages=[
+        {"items": [{"id": "al1"}], "next": "more"},
+        {"items": [{"id": "al2"}], "next": None},
+    ])
+    _install(monkeypatch, fake)
+    assert [a["id"] for a in server.get_artist_albums("art1")] == ["al1", "al2"]
+
+
+def test_artist_albums_excludes_appears_on_and_compilations(monkeypatch):
+    # An "appears_on" album would credit this artist for someone else's record,
+    # which is exactly the wrong answer for "songs by this artist".
+    fake = _FakeSpotify(artist_albums_pages=[{"items": [], "next": None}])
+    _install(monkeypatch, fake)
+    server.get_artist_albums("art1")
+    assert fake.artist_albums_calls == [("art1", "album,single")]
+
+
+def test_artist_albums_honours_a_limit(monkeypatch):
+    fake = _FakeSpotify(artist_albums_pages=[
+        {"items": [{"id": "al1"}, {"id": "al2"}, {"id": "al3"}], "next": None},
+    ])
+    _install(monkeypatch, fake)
+    assert len(server.get_artist_albums("art1", limit=2)) == 2
+
+
+def test_album_tracks_pages_through_everything(monkeypatch):
+    fake = _FakeSpotify(album_tracks_pages=[
+        {"items": [{"id": "t1"}], "next": "more"},
+        {"items": [{"id": "t2"}], "next": None},
+    ])
+    _install(monkeypatch, fake)
+    assert [t["id"] for t in server.get_album_tracks("al1")] == ["t1", "t2"]
