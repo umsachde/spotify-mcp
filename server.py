@@ -104,6 +104,15 @@ def handle_errors(fn):
     return wrapper
 
 
+# Spotify documents a maximum page size of 50 for /artists/{id}/albums, and
+# rejects anything above 10 on a restricted app registration -- measured: 50,
+# 49 and 20 all return "400 Invalid limit", 10 succeeds. The cap is specific to
+# this endpoint; album_tracks and current_user_playlists both accept 50 on the
+# same registration, so only this one pays for smaller pages. Pagination still
+# works underneath the cap, so nothing is lost but round-trips.
+_ARTIST_ALBUM_PAGE = 10
+
+
 def _paginate(first_page: dict[str, Any], limit: int | None, item_key: str = "items") -> list[Any]:
     """Follow spotipy's cursor-paginated responses until exhausted or `limit`
     items are collected. `limit=None` fetches everything."""
@@ -136,16 +145,45 @@ def get_playlists(limit: int | None = None) -> list[dict[str, Any]]:
     return _paginate(first, limit)
 
 
+def _track_of(item: dict[str, Any]) -> dict[str, Any] | None:
+    """The track object inside a playlist/saved-tracks row, in either shape.
+
+    Spotify returns two different payloads for a playlist row. The documented
+    one puts the track object under `track`. The one this account actually
+    receives puts it under `item`, and uses `track` as a *boolean* flag
+    meaning "this is a track, not an episode":
+
+        {"added_at": ..., "track": null, "item": {"type": "track", ...}}
+
+    Reading `it["track"]` therefore yielded None for every row, so the filter
+    dropped all of them and every playlist came back **empty** -- measured, a
+    playlist reporting `total=20` returned 0 tracks. That is not a cosmetic
+    bug: re-com builds its library exclusion set from these rows, so its
+    never-recommend-what-you-already-have guarantee silently covered saved
+    tracks only, and `recommend_from_playlist` had nothing to seed from.
+
+    Episodes and local files have no `id` and are still skipped.
+    """
+    candidate = item.get("track")
+    if not isinstance(candidate, dict):
+        # `track: true` (the flag form) or null -- the object is under `item`.
+        candidate = item.get("item")
+    if not isinstance(candidate, dict) or not candidate.get("id"):
+        return None
+    return candidate
+
+
 @mcp.tool()
 @handle_errors
 def get_playlist_tracks(playlist_id: str, limit: int | None = None) -> list[dict[str, Any]]:
     """Get the tracks in a playlist. Omit `limit` to fetch the entire playlist.
 
-    Local files and episodes (no `track.id`) are skipped.
+    Local files and episodes (no track id) are skipped. See `_track_of` for
+    the two payload shapes this has to read.
     """
     first = _client().playlist_items(playlist_id, limit=min(limit or 100, 100))
     raw_items = _paginate(first, None)  # page fully; trim to `limit` after filtering below
-    tracks = [it["track"] for it in raw_items if it.get("track") and it["track"].get("id")]
+    tracks = [t for t in (_track_of(it) for it in raw_items) if t]
     return tracks[:limit] if limit is not None else tracks
 
 
@@ -155,7 +193,9 @@ def get_saved_tracks(limit: int | None = None) -> list[dict[str, Any]]:
     """Get the current user's saved ("Liked Songs") tracks. Omit `limit` for all of them."""
     first = _client().current_user_saved_tracks(limit=min(limit or 50, 50))
     raw_items = _paginate(first, None)
-    tracks = [it["track"] for it in raw_items if it.get("track") and it["track"].get("id")]
+    # Saved tracks still arrive in the documented shape, but share the reader:
+    # one place to fix if this payload shifts the way playlist rows did.
+    tracks = [t for t in (_track_of(it) for it in raw_items) if t]
     return tracks[:limit] if limit is not None else tracks
 
 
@@ -240,7 +280,7 @@ def get_artist_albums(artist_id: str, limit: int | None = None) -> list[dict[str
     the artist for other people's records.
     """
     first = _client().artist_albums(
-        artist_id, album_type="album,single", limit=min(limit or 50, 50)
+        artist_id, album_type="album,single", limit=min(limit or _ARTIST_ALBUM_PAGE, _ARTIST_ALBUM_PAGE)
     )
     return _paginate(first, limit)
 

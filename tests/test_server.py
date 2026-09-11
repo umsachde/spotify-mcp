@@ -64,6 +64,7 @@ class _FakeSpotify:
         self.playlist_add_items_calls = []
         self.playlist_create_calls = []
         self.artist_albums_calls = []
+        self.artist_albums_limits = []
 
     def _raise_if_exc(self, value):
         if isinstance(value, Exception):
@@ -87,6 +88,7 @@ class _FakeSpotify:
 
     def artist_albums(self, artist_id, album_type=None, limit=None):
         self.artist_albums_calls.append((artist_id, album_type))
+        self.artist_albums_limits.append(limit)
         return self._raise_if_exc(self._artist_albums_pages[0])
 
     def album_tracks(self, album_id, limit=None):
@@ -393,3 +395,60 @@ def test_album_tracks_pages_through_everything(monkeypatch):
     ])
     _install(monkeypatch, fake)
     assert [t["id"] for t in server.get_album_tracks("al1")] == ["t1", "t2"]
+
+
+def test_artist_albums_requests_a_page_small_enough_for_a_restricted_app(monkeypatch):
+    # Measured on a real restricted registration: limit=20 and above return
+    # "400 Invalid limit" on this endpoint alone. Asking for more than the cap
+    # fails the call outright rather than returning fewer albums, so the page
+    # size is not a tuning knob.
+    fake = _FakeSpotify(artist_albums_pages=[{"items": [], "next": None}])
+    _install(monkeypatch, fake)
+    server.get_artist_albums("art1", limit=500)
+    assert fake.artist_albums_limits == [server._ARTIST_ALBUM_PAGE]
+
+
+# --- the two playlist-row payload shapes ------------------------------------
+
+
+def test_playlist_rows_in_the_documented_shape_are_read(monkeypatch):
+    _install(monkeypatch, _FakeSpotify(playlist_items_pages=[
+        {"items": [{"track": {"id": "t1", "name": "Song"}}], "next": None},
+    ]))
+    assert [t["id"] for t in server.get_playlist_tracks("p1")] == ["t1"]
+
+
+def test_playlist_rows_with_the_track_under_item_are_read(monkeypatch):
+    # The shape a real account actually returns: `track` is a boolean flag and
+    # the object lives under `item`. Reading it["track"] dropped every row, so
+    # playlists reporting total=20 came back empty and re-com's exclusion set
+    # silently covered saved tracks only.
+    _install(monkeypatch, _FakeSpotify(playlist_items_pages=[
+        {"items": [{"track": True, "item": {"id": "t1", "name": "Song", "type": "track"}}],
+         "next": None},
+    ]))
+    assert [t["id"] for t in server.get_playlist_tracks("p1")] == ["t1"]
+
+
+def test_a_row_with_neither_shape_is_skipped_not_crashed(monkeypatch):
+    _install(monkeypatch, _FakeSpotify(playlist_items_pages=[
+        {"items": [{"track": None}, {"track": True, "item": None}, {}], "next": None},
+    ]))
+    assert server.get_playlist_tracks("p1") == []
+
+
+def test_episodes_and_local_files_are_still_skipped(monkeypatch):
+    # No id -- the original reason this filter existed.
+    _install(monkeypatch, _FakeSpotify(playlist_items_pages=[
+        {"items": [{"item": {"name": "An Episode", "type": "episode"}},
+                   {"item": {"id": "t1", "name": "Song"}}], "next": None},
+    ]))
+    assert [t["id"] for t in server.get_playlist_tracks("p1")] == ["t1"]
+
+
+def test_saved_tracks_read_the_same_shapes(monkeypatch):
+    _install(monkeypatch, _FakeSpotify(saved_tracks_pages=[
+        {"items": [{"track": {"id": "s1"}}, {"track": True, "item": {"id": "s2"}}],
+         "next": None},
+    ]))
+    assert [t["id"] for t in server.get_saved_tracks()] == ["s1", "s2"]
